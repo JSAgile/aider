@@ -5,12 +5,13 @@ from unittest.mock import MagicMock, patch
 import openai
 import requests
 
-from aider.coder import Coder
+from aider import models
+from aider.coders import Coder
 
 
 class TestCoder(unittest.TestCase):
     def setUp(self):
-        self.patcher = patch("aider.coder.Coder.check_model_availability")
+        self.patcher = patch("aider.coders.base_coder.check_model_availability")
         self.mock_check = self.patcher.start()
         self.mock_check.return_value = True
 
@@ -22,7 +23,7 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
         # Mock the git repo
         mock_repo = MagicMock()
@@ -41,7 +42,7 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
         # Mock the git repo
         mock_repo = MagicMock()
@@ -60,7 +61,7 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
         # Mock the git repo
         mock_repo = MagicMock()
@@ -77,10 +78,14 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
-        # Mock the send method to return a tuple with a message and False
-        coder.send = MagicMock(return_value=("a good commit message", False))
+        # Mock the send method to set partial_response_content and return False
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = "a good commit message"
+            return False
+
+        coder.send = MagicMock(side_effect=mock_send)
 
         # Call the get_commit_message method with dummy diff and context
         result = coder.get_commit_message("dummy diff", "dummy context")
@@ -93,10 +98,14 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
-        # Mock the send method to return a tuple with a message and False
-        coder.send = MagicMock(return_value=('"a good commit message"', False))
+        # Mock the send method to set partial_response_content and return False
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = "a good commit message"
+            return False
+
+        coder.send = MagicMock(side_effect=mock_send)
 
         # Call the get_commit_message method with dummy diff and context
         result = coder.get_commit_message("dummy diff", "dummy context")
@@ -109,10 +118,14 @@ class TestCoder(unittest.TestCase):
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
-        # Mock the send method to return a tuple with a message and False
-        coder.send = MagicMock(return_value=('a good "commit message"', False))
+        # Mock the send method to set partial_response_content and return False
+        def mock_send(*args, **kwargs):
+            coder.partial_response_content = 'a good "commit message"'
+            return False
+
+        coder.send = MagicMock(side_effect=mock_send)
 
         # Call the get_commit_message method with dummy diff and context
         result = coder.get_commit_message("dummy diff", "dummy context")
@@ -120,14 +133,14 @@ class TestCoder(unittest.TestCase):
         # Assert that the returned message is the expected one
         self.assertEqual(result, 'a good "commit message"')
 
-    @patch("aider.coder.openai.ChatCompletion.create")
+    @patch("aider.coders.base_coder.openai.ChatCompletion.create")
     @patch("builtins.print")
     def test_send_with_retries_rate_limit_error(self, mock_print, mock_chat_completion_create):
         # Mock the IO object
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
         # Set up the mock to raise RateLimitError on
         # the first call and return None on the second call
@@ -137,19 +150,19 @@ class TestCoder(unittest.TestCase):
         ]
 
         # Call the send_with_retries method
-        coder.send_with_retries("model", ["message"])
+        coder.send_with_retries("model", ["message"], None)
 
         # Assert that print was called once
         mock_print.assert_called_once()
 
-    @patch("aider.coder.openai.ChatCompletion.create")
+    @patch("aider.coders.base_coder.openai.ChatCompletion.create")
     @patch("builtins.print")
     def test_send_with_retries_connection_error(self, mock_print, mock_chat_completion_create):
         # Mock the IO object
         mock_io = MagicMock()
 
         # Initialize the Coder object with the mocked IO and mocked repo
-        coder = Coder(io=mock_io, openai_api_key="fake_key")
+        coder = Coder.create(models.GPT4, None, mock_io, openai_api_key="fake_key")
 
         # Set up the mock to raise ConnectionError on the first call
         # and return None on the second call
@@ -159,7 +172,7 @@ class TestCoder(unittest.TestCase):
         ]
 
         # Call the send_with_retries method
-        coder.send_with_retries("model", ["message"])
+        coder.send_with_retries("model", ["message"], None)
 
         # Assert that print was called once
         mock_print.assert_called_once()

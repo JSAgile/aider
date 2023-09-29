@@ -4,8 +4,8 @@ import sys
 import configargparse
 import git
 
-from aider import models
-from aider.coder import Coder
+from aider import __version__, models
+from aider.coders import Coder
 from aider.io import InputOutput
 
 
@@ -30,11 +30,18 @@ def main(args=None, input=None, output=None):
         default_config_files.insert(0, os.path.join(git_root, ".aider.conf.yml"))
 
     parser = configargparse.ArgumentParser(
-        description="aider - chat with GPT about your code",
+        description="aider is GPT powered coding in your terminal",
         add_config_file_help=True,
         default_config_files=default_config_files,
         config_file_parser_class=configargparse.YAMLConfigFileParser,
         auto_env_var_prefix="AIDER_",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the version number and exit",
     )
 
     parser.add_argument(
@@ -87,6 +94,12 @@ def main(args=None, input=None, output=None):
         help=f"Use {models.GPT35_16k.name} model for the main chat (gpt-4 is better)",
     )
     parser.add_argument(
+        "--edit-format",
+        metavar="EDIT_FORMAT",
+        default=None,
+        help="Specify what edit format GPT should use (default depends on model)",
+    )
+    parser.add_argument(
         "--pretty",
         action="store_true",
         default=True,
@@ -97,6 +110,20 @@ def main(args=None, input=None, output=None):
         action="store_false",
         dest="pretty",
         help="Disable pretty, colorized output",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_false",
+        dest="stream",
+        default=True,
+        help="Disable streaming responses",
+    )
+    parser.add_argument(
+        "--no-git",
+        action="store_false",
+        dest="git",
+        default=True,
+        help="Do not look for a git repo",
     )
     parser.add_argument(
         "--user-input-color",
@@ -112,6 +139,11 @@ def main(args=None, input=None, output=None):
         "--tool-error-color",
         default="red",
         help="Set the color for tool error messages (default: red)",
+    )
+    parser.add_argument(
+        "--assistant-output-color",
+        default="blue",
+        help="Set the color for assistant output (default: blue)",
     )
     parser.add_argument(
         "--apply",
@@ -179,7 +211,7 @@ def main(args=None, input=None, output=None):
         "--yes",
         action="store_true",
         help="Always say yes to every confirmation",
-        default=False,
+        default=None,
     )
     parser.add_argument(
         "-v",
@@ -187,6 +219,13 @@ def main(args=None, input=None, output=None):
         action="store_true",
         help="Enable verbose output",
         default=False,
+    )
+    parser.add_argument(
+        "--message",
+        "--msg",
+        "-m",
+        metavar="COMMAND",
+        help="Specify a single message to send GPT, process reply then exit (disables chat mode)",
     )
     args = parser.parse_args(args)
 
@@ -215,9 +254,15 @@ def main(args=None, input=None, output=None):
         io.tool_error("No OpenAI API key provided. Use --openai-api-key or env OPENAI_API_KEY.")
         return 1
 
-    coder = Coder(
+    main_model = models.Model(args.model)
+
+    coder = Coder.create(
+        main_model,
+        args.edit_format,
         io,
-        main_model=args.model,
+        args.openai_api_key,
+        args.openai_api_base,
+        ##
         fnames=args.files,
         pretty=args.pretty,
         show_diffs=args.show_diffs,
@@ -226,8 +271,9 @@ def main(args=None, input=None, output=None):
         dry_run=args.dry_run,
         map_tokens=args.map_tokens,
         verbose=args.verbose,
-        openai_api_key=args.openai_api_key,
-        openai_api_base=args.openai_api_base,
+        assistant_output_color=args.assistant_output_color,
+        stream=args.stream,
+        use_git=args.git,
     )
 
     if args.dirty_commits:
@@ -240,7 +286,11 @@ def main(args=None, input=None, output=None):
         return
 
     io.tool_output("Use /help to see in-chat commands.")
-    coder.run()
+    if args.message:
+        io.tool_output()
+        coder.run(with_message=args.message)
+    else:
+        coder.run()
 
 
 if __name__ == "__main__":

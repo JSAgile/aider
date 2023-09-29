@@ -1,28 +1,40 @@
 #!/usr/bin/env python
 
+import hashlib
+import json
 import os
 import sys
 import traceback
+from json.decoder import JSONDecodeError
 from pathlib import Path
 
 import backoff
 import git
 import openai
 import requests
-from openai.error import RateLimitError
-from rich.console import Console
+from jsonschema import Draft7Validator
+from openai.error import APIError, RateLimitError, ServiceUnavailableError, Timeout
+from rich.console import Console, Text
 from rich.live import Live
 from rich.markdown import Markdown
 
-from aider import diffs, models, prompts, utils
+from aider import models, prompts, utils
 from aider.commands import Commands
 from aider.repomap import RepoMap
 
-from .dump import dump  # noqa: F401
+from ..dump import dump  # noqa: F401
 
 
 class MissingAPIKeyError(ValueError):
     pass
+
+
+class ExhaustedContextWindow(Exception):
+    pass
+
+
+def wrap_fence(name):
+    return f"<{name}>", f"</{name}>"
 
 
 class Coder:
@@ -31,16 +43,65 @@ class Coder:
     last_aider_commit_hash = None
     last_asked_for_commit_time = 0
     repo_map = None
+    functions = None
+    total_cost = 0.0
+    num_exhausted_context_windows = 0
 
-    def check_model_availability(self, main_model):
-        available_models = openai.Model.list()
-        model_ids = [model.id for model in available_models["data"]]
-        return main_model.name in model_ids
+    @classmethod
+    def create(
+        self,
+        main_model,
+        edit_format,
+        io,
+        openai_api_key,
+        openai_api_base="https://api.openai.com/v1",
+        **kwargs,
+    ):
+        from . import (
+            EditBlockCoder,
+            EditBlockFunctionCoder,
+            SingleWholeFileFunctionCoder,
+            WholeFileCoder,
+            WholeFileFunctionCoder,
+        )
+
+        openai.api_key = openai_api_key
+        openai.api_base = openai_api_base
+
+        if not main_model:
+            main_model = models.GPT35_16k
+
+        if not main_model.always_available:
+            if not check_model_availability(main_model):
+                if main_model != models.GPT4:
+                    io.tool_error(
+                        f"API key does not support {main_model.name}, falling back to"
+                        f" {models.GPT35_16k.name}"
+                    )
+                main_model = models.GPT35_16k
+
+        if edit_format is None:
+            edit_format = main_model.edit_format
+
+        if edit_format == "diff":
+            return EditBlockCoder(main_model, io, **kwargs)
+        elif edit_format == "whole":
+            return WholeFileCoder(main_model, io, **kwargs)
+        elif edit_format == "whole-func":
+            return WholeFileFunctionCoder(main_model, io, **kwargs)
+        elif edit_format == "single-whole-func":
+            return SingleWholeFileFunctionCoder(main_model, io, **kwargs)
+        elif edit_format == "diff-func-list":
+            return EditBlockFunctionCoder("list", main_model, io, **kwargs)
+        elif edit_format in ("diff-func", "diff-func-string"):
+            return EditBlockFunctionCoder("string", main_model, io, **kwargs)
+        else:
+            raise ValueError(f"Unknown edit format {edit_format}")
 
     def __init__(
         self,
+        main_model,
         io,
-        main_model=models.GPT4.name,
         fnames=None,
         pretty=True,
         show_diffs=False,
@@ -49,26 +110,31 @@ class Coder:
         dry_run=False,
         map_tokens=1024,
         verbose=False,
-        openai_api_key=None,
-        openai_api_base=None,
+        assistant_output_color="blue",
+        stream=True,
+        use_git=True,
     ):
-        if not openai_api_key:
-            raise MissingAPIKeyError("No OpenAI API key provided.")
-        openai.api_key = openai_api_key
-        openai.api_base = openai_api_base
+        if not fnames:
+            fnames = []
+
+        self.chat_completion_call_hashes = []
+        self.chat_completion_response_hashes = []
 
         self.verbose = verbose
         self.abs_fnames = set()
         self.cur_messages = []
         self.done_messages = []
+        self.num_control_c = 0
 
         self.io = io
+        self.stream = stream
 
         if not auto_commits:
             dirty_commits = False
 
         self.auto_commits = auto_commits
         self.dirty_commits = dirty_commits
+        self.assistant_output_color = assistant_output_color
 
         self.dry_run = dry_run
         self.pretty = pretty
@@ -78,37 +144,27 @@ class Coder:
         else:
             self.console = Console(force_terminal=True, no_color=True)
 
-        main_model = models.get_model(main_model)
-        if not main_model.is_always_available():
-            if not self.check_model_availability(main_model):
-                if main_model != models.GPT4:
-                    self.io.tool_error(f"API key does not support {main_model.name}.")
-                main_model = models.GPT35_16k
-
         self.main_model = main_model
-        if main_model.is_gpt35():
-            self.io.tool_output(
-                f"Using {main_model.name} (experimental): disabling ctags/repo-maps.",
-            )
-            self.gpt_prompts = prompts.GPT35()
-        else:
-            self.io.tool_output(f"Using {main_model.name}.")
-            self.gpt_prompts = prompts.GPT4()
+
+        self.io.tool_output(f"Model: {main_model.name}")
 
         self.show_diffs = show_diffs
 
         self.commands = Commands(self.io, self)
 
-        self.set_repo(fnames)
+        if use_git:
+            self.set_repo(fnames)
+        else:
+            self.abs_fnames = set([str(Path(fname).resolve()) for fname in fnames])
 
         if self.repo:
             rel_repo_dir = os.path.relpath(self.repo.git_dir, os.getcwd())
-            self.io.tool_output(f"Using git repo: {rel_repo_dir}")
+            self.io.tool_output(f"Git repo: {rel_repo_dir}")
         else:
-            self.io.tool_output("Not using git.")
+            self.io.tool_output("Git repo: none")
             self.find_common_root()
 
-        if main_model.is_gpt4():
+        if main_model.use_repo_map and self.repo and self.gpt_prompts.repo_content_prefix:
             rm_io = io if self.verbose else None
             self.repo_map = RepoMap(
                 map_tokens,
@@ -119,19 +175,34 @@ class Coder:
             )
 
             if self.repo_map.use_ctags:
-                self.io.tool_output("Using universal-ctags to build repo-map.")
+                self.io.tool_output(f"Repo-map: universal-ctags using {map_tokens} tokens")
             elif not self.repo_map.has_ctags and map_tokens > 0:
-                self.io.tool_output("Can't find universal-ctags, using basic repo-map.")
+                self.io.tool_output(
+                    f"Repo-map: basic using {map_tokens} tokens"
+                    f" ({self.repo_map.ctags_disabled_reason})"
+                )
             else:
-                self.io.tool_output("Not using repo map.")
+                self.io.tool_output("Repo-map: disabled because map_tokens == 0")
+        else:
+            self.io.tool_output("Repo-map: disabled")
 
         for fname in self.get_inchat_relative_files():
             self.io.tool_output(f"Added {fname} to the chat.")
 
+        # validate the functions jsonschema
+        if self.functions:
+            for function in self.functions:
+                Draft7Validator.check_schema(function)
+
+            if self.verbose:
+                self.io.tool_output("JSON Schema:")
+                self.io.tool_output(json.dumps(self.functions, indent=4))
+
     def find_common_root(self):
-        if self.abs_fnames:
-            common_prefix = os.path.commonpath(list(self.abs_fnames))
-            self.root = os.path.dirname(common_prefix)
+        if len(self.abs_fnames) == 1:
+            self.root = os.path.dirname(list(self.abs_fnames)[0])
+        elif self.abs_fnames:
+            self.root = os.path.commonpath(list(self.abs_fnames))
         else:
             self.root = os.getcwd()
 
@@ -200,6 +271,42 @@ class Coder:
 
         self.repo = repo
 
+    # fences are obfuscated so aider can modify this file!
+    fences = [
+        ("``" + "`", "``" + "`"),
+        wrap_fence("source"),
+        wrap_fence("code"),
+        wrap_fence("pre"),
+        wrap_fence("codeblock"),
+        wrap_fence("sourcecode"),
+    ]
+    fence = fences[0]
+
+    def choose_fence(self):
+        all_content = ""
+        for fname in self.abs_fnames:
+            all_content += Path(fname).read_text() + "\n"
+
+        all_content = all_content.splitlines()
+
+        good = False
+        for fence_open, fence_close in self.fences:
+            if fence_open in all_content or fence_close in all_content:
+                continue
+            good = True
+            break
+
+        if good:
+            self.fence = (fence_open, fence_close)
+        else:
+            self.fence = self.fences[0]
+            self.io.tool_error(
+                "Unable to find a fencing strategy! Falling back to:"
+                " {self.fence[0]}...{self.fence[1]}"
+            )
+
+        return
+
     def get_files_content(self, fnames=None):
         if not fnames:
             fnames = self.abs_fnames
@@ -207,7 +314,7 @@ class Coder:
         prompt = ""
         for fname in fnames:
             relative_fname = self.get_rel_fname(fname)
-            prompt += utils.quoted_file(fname, relative_fname)
+            prompt += utils.quoted_file(fname, relative_fname, fence=self.fence)
         return prompt
 
     def get_files_messages(self):
@@ -234,22 +341,25 @@ class Coder:
         ]
         if self.abs_fnames:
             files_messages += [
-                dict(role="system", content=self.gpt_prompts.system_reminder),
+                dict(role="system", content=self.fmt_system_reminder()),
             ]
 
         return files_messages
 
-    def run(self):
-        self.done_messages = []
-        self.cur_messages = []
-
-        self.num_control_c = 0
-
+    def run(self, with_message=None):
         while True:
             try:
-                new_user_message = self.run_loop()
+                if with_message:
+                    new_user_message = with_message
+                    self.io.user_input(with_message)
+                else:
+                    new_user_message = self.run_loop()
+
                 while new_user_message:
                     new_user_message = self.send_new_user_message(new_user_message)
+
+                if with_message:
+                    return
 
             except KeyboardInterrupt:
                 self.num_control_c += 1
@@ -313,14 +423,21 @@ class Coder:
 
         return self.send_new_user_message(inp)
 
+    def fmt_system_reminder(self):
+        prompt = self.gpt_prompts.system_reminder
+        prompt = prompt.format(fence=self.fence)
+        return prompt
+
     def send_new_user_message(self, inp):
+        self.choose_fence()
+
         self.cur_messages += [
             dict(role="user", content=inp),
         ]
 
         main_sys = self.gpt_prompts.main_system
-        if self.main_model.is_gpt4():
-            main_sys += "\n" + self.gpt_prompts.system_reminder
+        # if self.main_model.max_context_tokens > 4 * 1024:
+        main_sys += "\n" + self.fmt_system_reminder()
 
         messages = [
             dict(role="system", content=main_sys),
@@ -332,11 +449,41 @@ class Coder:
         messages += self.cur_messages
 
         if self.verbose:
-            utils.show_messages(messages)
+            utils.show_messages(messages, functions=self.functions)
 
-        content, interrupted = self.send(messages)
+        exhausted = False
+        interrupted = False
+        try:
+            interrupted = self.send(messages, functions=self.functions)
+        except ExhaustedContextWindow:
+            exhausted = True
+        except openai.error.InvalidRequestError as err:
+            if "maximum context length" in str(err):
+                exhausted = True
+
+        if exhausted:
+            self.num_exhausted_context_windows += 1
+            self.io.tool_error("The chat session is larger than the context window!\n")
+            self.commands.cmd_tokens("")
+            self.io.tool_error("\nTo reduce token usage:")
+            self.io.tool_error(" - Use /drop to remove unneeded files from the chat session.")
+            self.io.tool_error(" - Use /clear to clear chat history.")
+            return
+
+        if self.partial_response_function_call:
+            args = self.parse_partial_args()
+            if args:
+                content = args["explanation"]
+            else:
+                content = ""
+        elif self.partial_response_content:
+            content = self.partial_response_content
+        else:
+            content = ""
+
         if interrupted:
             self.io.tool_error("\n\n^C KeyboardInterrupt")
+            self.num_control_c += 1
             content += "\n^C KeyboardInterrupt"
 
         self.io.tool_output()
@@ -344,30 +491,29 @@ class Coder:
             self.cur_messages += [dict(role="assistant", content=content)]
             return
 
-        edited, edit_error = self.apply_updates(content)
+        edited, edit_error = self.apply_updates()
         if edit_error:
             return edit_error
 
-        if self.main_model.is_gpt4() or not edited:
-            # Don't add 3.5 assistant messages to the history if they contain "edits"
-            # Because those edits are actually fully copies of the file!
-            # That wastes too much context window.
-            self.cur_messages += [dict(role="assistant", content=content)]
-        else:
-            self.cur_messages += [
-                dict(role="assistant", content=self.gpt_prompts.redacted_edit_message)
-            ]
+        # TODO: this shouldn't use content, should use self.partial_....
+        self.update_cur_messages(content, edited)
 
         if edited:
-            if self.auto_commits:
+            if self.repo and self.auto_commits and not self.dry_run:
                 saved_message = self.auto_commit()
+            elif hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
+                saved_message = self.gpt_prompts.files_content_gpt_edits_no_repo
             else:
                 saved_message = None
+
             self.move_back_cur_messages(saved_message)
 
         add_rel_files_message = self.check_for_file_mentions(content)
         if add_rel_files_message:
             return add_rel_files_message
+
+    def update_cur_messages(self, content, edited):
+        self.cur_messages += [dict(role="assistant", content=content)]
 
     def auto_commit(self):
         res = self.commit(history=self.cur_messages, prefix="aider: ")
@@ -380,8 +526,8 @@ class Coder:
                 message=commit_message,
             )
         else:
-            # TODO: if not self.repo then the files_content_gpt_no_edits isn't appropriate
-            self.io.tool_error("Warning: no changes found in tracked files.")
+            if self.repo:
+                self.io.tool_error("Warning: no changes found in tracked files.")
             saved_message = self.gpt_prompts.files_content_gpt_no_edits
 
         return saved_message
@@ -430,36 +576,109 @@ class Coder:
 
     @backoff.on_exception(
         backoff.expo,
-        (RateLimitError, requests.exceptions.ConnectionError),
+        (
+            Timeout,
+            APIError,
+            ServiceUnavailableError,
+            RateLimitError,
+            requests.exceptions.ConnectionError,
+        ),
         max_tries=5,
         on_backoff=lambda details: print(f"Retry in {details['wait']} seconds."),
     )
-    def send_with_retries(self, model, messages):
-        return openai.ChatCompletion.create(
+    def send_with_retries(self, model, messages, functions):
+        kwargs = dict(
             model=model,
             messages=messages,
             temperature=0,
-            stream=True,
+            stream=self.stream,
         )
+        if functions is not None:
+            kwargs["functions"] = self.functions
 
-    def send(self, messages, model=None, silent=False):
+        # Generate SHA1 hash of kwargs and append it to chat_completion_call_hashes
+        hash_object = hashlib.sha1(json.dumps(kwargs, sort_keys=True).encode())
+        self.chat_completion_call_hashes.append(hash_object.hexdigest())
+
+        res = openai.ChatCompletion.create(**kwargs)
+        return res
+
+    def send(self, messages, model=None, silent=False, functions=None):
         if not model:
             model = self.main_model.name
 
-        self.resp = ""
+        self.partial_response_content = ""
+        self.partial_response_function_call = dict()
+
         interrupted = False
         try:
-            completion = self.send_with_retries(model, messages)
-            self.show_send_output(completion, silent)
+            completion = self.send_with_retries(model, messages, functions)
+            if self.stream:
+                self.show_send_output_stream(completion, silent)
+            else:
+                self.show_send_output(completion, silent)
         except KeyboardInterrupt:
             interrupted = True
 
         if not silent:
-            self.io.ai_output(self.resp)
+            if self.partial_response_content:
+                self.io.ai_output(self.partial_response_content)
+            elif self.partial_response_function_call:
+                # TODO: push this into subclasses
+                args = self.parse_partial_args()
+                if args:
+                    self.io.ai_output(json.dumps(args, indent=4))
 
-        return self.resp, interrupted
+        return interrupted
 
     def show_send_output(self, completion, silent):
+        if self.verbose:
+            print(completion)
+
+        show_func_err = None
+        show_content_err = None
+        try:
+            self.partial_response_function_call = completion.choices[0].message.function_call
+        except AttributeError as func_err:
+            show_func_err = func_err
+
+        try:
+            self.partial_response_content = completion.choices[0].message.content
+        except AttributeError as content_err:
+            show_content_err = content_err
+
+        resp_hash = dict(
+            function_call=self.partial_response_function_call,
+            content=self.partial_response_content,
+        )
+        resp_hash = hashlib.sha1(json.dumps(resp_hash, sort_keys=True).encode())
+        self.chat_completion_response_hashes.append(resp_hash.hexdigest())
+
+        if show_func_err and show_content_err:
+            self.io.tool_error(show_func_err)
+            self.io.tool_error(show_content_err)
+            raise Exception("No data found in openai response!")
+
+        prompt_tokens = completion.usage.prompt_tokens
+        completion_tokens = completion.usage.completion_tokens
+
+        tokens = f"{prompt_tokens} prompt tokens, {completion_tokens} completion tokens"
+        if self.main_model.prompt_price:
+            cost = prompt_tokens * self.main_model.prompt_price / 1000
+            cost += completion_tokens * self.main_model.completion_price / 1000
+            tokens += f", ${cost:.6f} cost"
+            self.total_cost += cost
+
+        show_resp = self.render_incremental_response(True)
+        if self.pretty:
+            show_resp = Markdown(show_resp, style=self.assistant_output_color, code_theme="default")
+        else:
+            show_resp = Text(show_resp or "<no response>")
+
+        self.io.console.print(show_resp)
+        self.io.console.print(tokens)
+
+    def show_send_output_stream(self, completion, silent):
         live = None
         if self.pretty and not silent:
             live = Live(vertical_overflow="scroll")
@@ -469,154 +688,50 @@ class Coder:
                 live.start()
 
             for chunk in completion:
-                if chunk.choices[0].finish_reason not in (None, "stop"):
-                    assert False, "Exceeded context window!"
+                if chunk.choices[0].finish_reason == "length":
+                    raise ExhaustedContextWindow()
+
+                try:
+                    func = chunk.choices[0].delta.function_call
+                    # dump(func)
+                    for k, v in func.items():
+                        if k in self.partial_response_function_call:
+                            self.partial_response_function_call[k] += v
+                        else:
+                            self.partial_response_function_call[k] = v
+                except AttributeError:
+                    pass
 
                 try:
                     text = chunk.choices[0].delta.content
-                    self.resp += text
+                    if text:
+                        self.partial_response_content += text
                 except AttributeError:
-                    continue
+                    pass
 
                 if silent:
                     continue
 
                 if self.pretty:
-                    show_resp = self.resp
-                    if self.main_model.is_gpt35():
-                        try:
-                            show_resp = self.update_files_gpt35(self.resp, mode="diff")
-                        except ValueError:
-                            pass
-                    md = Markdown(show_resp, style="blue", code_theme="default")
-                    live.update(md)
+                    self.live_incremental_response(live, False)
                 else:
                     sys.stdout.write(text)
                     sys.stdout.flush()
         finally:
             if live:
+                self.live_incremental_response(live, True)
                 live.stop()
 
-    def update_files_gpt35(self, content, mode="update"):
-        edited = set()
-        chat_files = self.get_inchat_relative_files()
-        if not chat_files:
-            if mode == "diff":
-                return content
+    def live_incremental_response(self, live, final):
+        show_resp = self.render_incremental_response(final)
+        if not show_resp:
             return
 
-        output = []
-        lines = content.splitlines(keepends=True)
-        fname = None
-        new_lines = []
-        for i, line in enumerate(lines):
-            if line.startswith("```"):
-                if fname:
-                    # ending an existing block
-                    full_path = os.path.abspath(os.path.join(self.root, fname))
+        md = Markdown(show_resp, style=self.assistant_output_color, code_theme="default")
+        live.update(md)
 
-                    if mode == "diff":
-                        with open(full_path, "r") as f:
-                            orig_lines = f.readlines()
-
-                        show_diff = diffs.diff_partial_update(
-                            orig_lines,
-                            new_lines,
-                            final=True,
-                        ).splitlines()
-                        output += show_diff
-                    else:
-                        new_lines = "".join(new_lines)
-                        Path(full_path).write_text(new_lines)
-                        edited.add(fname)
-
-                    fname = None
-                    new_lines = []
-                    continue
-
-                # starting a new block
-                if i == 0:
-                    raise ValueError("No filename provided before ``` block")
-
-                fname = lines[i - 1].strip()
-                if fname not in chat_files:
-                    if len(chat_files) == 1:
-                        fname = list(chat_files)[0]
-                    else:
-                        show_chat_files = " ".join(chat_files)
-                        raise ValueError(f"{fname} is not one of: {show_chat_files}")
-
-            elif fname:
-                new_lines.append(line)
-            else:
-                output.append(line)
-
-        if mode == "diff":
-            if fname:
-                # ending an existing block
-                full_path = os.path.abspath(os.path.join(self.root, fname))
-
-                if mode == "diff":
-                    with open(full_path, "r") as f:
-                        orig_lines = f.readlines()
-
-                    show_diff = diffs.diff_partial_update(
-                        orig_lines,
-                        new_lines,
-                    ).splitlines()
-                    output += show_diff
-
-            return "\n".join(output)
-
-        if fname:
-            raise ValueError("Started a ``` block without closing it")
-
-        return edited
-
-    def update_files_gpt4(self, content):
-        # might raise ValueError for malformed ORIG/UPD blocks
-        edits = list(utils.find_original_update_blocks(content))
-
-        edited = set()
-        for path, original, updated in edits:
-            full_path = os.path.abspath(os.path.join(self.root, path))
-
-            if full_path not in self.abs_fnames:
-                if not Path(full_path).exists():
-                    question = f"Allow creation of new file {path}?"  # noqa: E501
-                else:
-                    question = (
-                        f"Allow edits to {path} which was not previously provided?"  # noqa: E501
-                    )
-                if not self.io.confirm_ask(question):
-                    self.io.tool_error(f"Skipping edit to {path}")
-                    continue
-
-                if not Path(full_path).exists():
-                    Path(full_path).parent.mkdir(parents=True, exist_ok=True)
-                    Path(full_path).touch()
-
-                self.abs_fnames.add(full_path)
-
-                # Check if the file is already in the repo
-                if self.repo:
-                    tracked_files = set(self.repo.git.ls_files().splitlines())
-                    relative_fname = self.get_rel_fname(full_path)
-                    if relative_fname not in tracked_files and self.io.confirm_ask(
-                        f"Add {path} to git?"
-                    ):
-                        self.repo.git.add(full_path)
-
-            edited.add(path)
-            if utils.do_replace(full_path, original, updated, self.dry_run):
-                if self.dry_run:
-                    self.io.tool_output(f"Dry run, did not apply edit to {path}")
-                else:
-                    self.io.tool_output(f"Applied edit to {path}")
-            else:
-                self.io.tool_error(f"Failed to apply edit to {path}")
-
-        return edited
+    def render_incremental_response(self, final):
+        return self.partial_response_content
 
     def get_context_from_history(self, history):
         context = ""
@@ -641,7 +756,7 @@ class Coder:
         ]
 
         try:
-            commit_message, interrupted = self.send(
+            interrupted = self.send(
                 messages,
                 model=models.GPT35.name,
                 silent=True,
@@ -653,6 +768,7 @@ class Coder:
             )
             return
 
+        commit_message = self.partial_response_content
         commit_message = commit_message.strip()
         if commit_message and commit_message[0] == '"' and commit_message[-1] == '"':
             commit_message = commit_message[1:-1].strip()
@@ -786,25 +902,111 @@ class Coder:
     def get_addable_relative_files(self):
         return set(self.get_all_relative_files()) - set(self.get_inchat_relative_files())
 
-    def apply_updates(self, content):
-        if self.main_model.is_gpt4():
-            method = self.update_files_gpt4
-        elif self.main_model.is_gpt35():
-            method = self.update_files_gpt35
+    def allowed_to_edit(self, path, write_content=None):
+        full_path = os.path.abspath(os.path.join(self.root, path))
+
+        if full_path in self.abs_fnames:
+            if not self.dry_run and write_content:
+                Path(full_path).write_text(write_content)
+            return full_path
+
+        if not Path(full_path).exists():
+            question = f"Allow creation of new file {path}?"  # noqa: E501
         else:
-            raise ValueError(f"apply_updates() doesn't support {self.main_model.name}")
+            question = f"Allow edits to {path} which was not previously provided?"  # noqa: E501
+        if not self.io.confirm_ask(question):
+            self.io.tool_error(f"Skipping edit to {path}")
+            return
+
+        if not Path(full_path).exists() and not self.dry_run:
+            Path(full_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(full_path).touch()
+
+        self.abs_fnames.add(full_path)
+
+        # Check if the file is already in the repo
+        if self.repo:
+            tracked_files = set(self.repo.git.ls_files().splitlines())
+            relative_fname = self.get_rel_fname(full_path)
+            if relative_fname not in tracked_files and self.io.confirm_ask(f"Add {path} to git?"):
+                if not self.dry_run:
+                    self.repo.git.add(full_path)
+
+        if not self.dry_run and write_content:
+            Path(full_path).write_text(write_content)
+
+        return full_path
+
+    apply_update_errors = 0
+
+    def apply_updates(self):
+        max_apply_update_errors = 2
 
         try:
-            edited = method(content)
-            return edited, None
+            edited = self.update_files()
         except ValueError as err:
             err = err.args[0]
-            self.io.tool_error("Malformed ORIGINAL/UPDATE blocks, retrying...")
-            self.io.tool_error(str(err))
-            return None, err
+            self.apply_update_errors += 1
+            if self.apply_update_errors < max_apply_update_errors:
+                self.io.tool_error(f"Malformed response #{self.apply_update_errors}, retrying...")
+                self.io.tool_error(str(err))
+                return None, err
+            else:
+                self.io.tool_error(f"Malformed response #{self.apply_update_errors}, aborting.")
+                return False, None
 
         except Exception as err:
             print(err)
             print()
             traceback.print_exc()
-            return None, err
+            self.apply_update_errors += 1
+            if self.apply_update_errors < max_apply_update_errors:
+                self.io.tool_error(f"Update exception #{self.apply_update_errors}, retrying...")
+                return None, str(err)
+            else:
+                self.io.tool_error(f"Update exception #{self.apply_update_errors}, aborting")
+                return False, None
+
+        self.apply_update_errors = 0
+
+        if edited:
+            for path in sorted(edited):
+                if self.dry_run:
+                    self.io.tool_output(f"Did not apply edit to {path} (--dry-run)")
+                else:
+                    self.io.tool_output(f"Applied edit to {path}")
+
+        return edited, None
+
+    def parse_partial_args(self):
+        # dump(self.partial_response_function_call)
+
+        data = self.partial_response_function_call.get("arguments")
+        if not data:
+            return
+
+        try:
+            return json.loads(data)
+        except JSONDecodeError:
+            pass
+
+        try:
+            return json.loads(data + "]}")
+        except JSONDecodeError:
+            pass
+
+        try:
+            return json.loads(data + "}]}")
+        except JSONDecodeError:
+            pass
+
+        try:
+            return json.loads(data + '"}]}')
+        except JSONDecodeError:
+            pass
+
+
+def check_model_availability(main_model):
+    available_models = openai.Model.list()
+    model_ids = [model.id for model in available_models["data"]]
+    return main_model.name in model_ids

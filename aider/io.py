@@ -14,6 +14,8 @@ from pygments.util import ClassNotFound
 from rich.console import Console
 from rich.text import Text
 
+from .dump import dump  # noqa: F401
+
 
 class AutoCompleter(Completer):
     def __init__(self, root, rel_fnames, addable_rel_fnames, commands):
@@ -81,6 +83,9 @@ class AutoCompleter(Completer):
 
 
 class InputOutput:
+    num_error_outputs = 0
+    num_user_asks = 0
+
     def __init__(
         self,
         pretty=True,
@@ -105,6 +110,7 @@ class InputOutput:
         self.output = output
         self.pretty = pretty
         self.yes = yes
+
         self.input_history_file = input_history_file
         if chat_history_file is not None:
             self.chat_history_file = Path(chat_history_file)
@@ -168,10 +174,12 @@ class InputOutput:
             session = PromptSession(**session_kwargs)
             line = session.prompt()
 
-            if line.strip() == "{" and not multiline_input:
+            if line and line[0] == "{" and not multiline_input:
                 multiline_input = True
+                inp += line[1:] + "\n"
                 continue
-            elif line.strip() == "}" and multiline_input:
+            elif line and line[-1] == "}" and multiline_input:
+                inp += line[:-1] + "\n"
                 break
             elif multiline_input:
                 inp += line + "\n"
@@ -180,7 +188,10 @@ class InputOutput:
                 break
 
         print()
+        self.user_input(inp)
+        return inp
 
+    def user_input(self, inp):
         prefix = "####"
         if inp:
             hist = inp.splitlines()
@@ -193,8 +204,6 @@ class InputOutput:
 {prefix} {hist}"""
         self.append_chat_history(hist, linebreak=True)
 
-        return inp
-
     # OUTPUT
 
     def ai_output(self, content):
@@ -202,30 +211,44 @@ class InputOutput:
         self.append_chat_history(hist)
 
     def confirm_ask(self, question, default="y"):
-        if self.yes:
+        self.num_user_asks += 1
+
+        if self.yes is True:
             res = "yes"
+        elif self.yes is False:
+            res = "no"
         else:
             res = prompt(question + " ", default=default)
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
+        if self.yes in (True, False):
+            self.tool_output(hist)
 
         if not res or not res.strip():
             return
         return res.strip().lower().startswith("y")
 
     def prompt_ask(self, question, default=None):
-        if self.yes:
+        self.num_user_asks += 1
+
+        if self.yes is True:
             res = "yes"
+        elif self.yes is False:
+            res = "no"
         else:
             res = prompt(question + " ", default=default)
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
+        if self.yes in (True, False):
+            self.tool_output(hist)
 
         return res
 
     def tool_error(self, message):
+        self.num_error_outputs += 1
+
         if message.strip():
             hist = f"{message.strip()}"
             self.append_chat_history(hist, linebreak=True, blockquote=True)

@@ -1,3 +1,20 @@
+# Test New LLMs (CodeLlama, Llama2, etc.)
+
+test other LLMs (codellama, wizardcoder, etc.) with it, I just wrote a [1-click proxy](https://github.com/BerriAI/litellm#openai-proxy-server) to translate openai calls to huggingface, anthropic, togetherai, etc. api calls.
+
+**code**
+```
+$ pip install litellm
+
+$ litellm --model huggingface/bigcode/starcoder
+
+#INFO:     Uvicorn running on http://0.0.0.0:8000
+
+$ aider --openai-api-base http://0.0.0.0:8000
+```
+
+I'd love to know if this solves a problem for you
+
 # aider is GPT powered coding in your terminal
 
 `aider` is a command-line chat tool that allows you to write and edit
@@ -11,12 +28,11 @@ It also has features that [help GPT-4 understand and modify larger codebases](ht
 - [Getting started](#getting-started)
 - [Example chat transcripts](#example-chat-transcripts)
 - [Features](#features)
-- [GPT-4 vs GPT-3.5](#gpt-4-vs-gpt-35)
 - [Installation](#installation)
 - [Usage](#usage)
 - [In-chat commands](#in-chat-commands)
 - [Tips](#tips)
-- [Limitations](#limitations)
+- [GPT-4 vs GPT-3.5](#gpt-4-vs-gpt-35)
 
 ## Getting started
 
@@ -56,37 +72,6 @@ You can find more chat transcripts on the [examples page](https://aider.chat/exa
 * Aider can [give *GPT-4* a map of your entire git repo](https://aider.chat/docs/ctags.html), which helps it understand and modify large codebases.
 * You can also edit files by hand using your editor while chatting with aider. Aider will notice these out-of-band edits and ask if you'd like to commit them. This lets you bounce back and forth between the aider chat and your editor, to collaboratively code with GPT.
 
-## GPT-4 vs GPT-3.5
-
-Aider supports
-`gpt-4`,
-`gpt-4-32k`,
-`gpt-3.5-turbo`
-and the the brand new `gpt-3.5-turbo-16k` model.
-You will probably get the best results with GPT-4,
-because of its large context window and
-greater competance at coding
-which will allow you to edit larger codebases.
-
-The GPT-3.5 models are limited to editing somewhat smaller codebases.
-They are less able to follow instructions for
-returning code edits in a compact format,
-so aider has
-to ask GPT-3.5 to return a full copy of any code that needs to be edited.
-This rapidly uses up the context window.
-In practice, this means you can only use `gpt-3.5-turbo` to edit files that are
-smaller than about 2k tokens (8k bytes).
-The new `gpt-3.5-turbo-16k` model should be able to edit code up to 8k tokens (32k bytes).
-
-Aider disables the
-[repository map feature](https://aider.chat/docs/ctags.html)
-when used with either of the GPT-3.5 models.
-The `gpt-3.5-turbo` context window is too small to include a repo map.
-Evaluation is needed to determine if `gpt-3.5-turbo-16k` can make use of a repo map.
-
-To use `gpt-3.5-turbo-16k`, install from GitHub per the instructions below and launch with `aider -3`.
-For now, aider just treats `gpt-3.5-turbo-16k` like the original `gpt-3.5-turbo` with a larger
-context window. 
 
 ## Installation
 
@@ -100,6 +85,8 @@ context window.
   * Or, by including `openai-api-key: sk-...` in an `.aider.config.yml` file
 
 3. Optionally, install [universal ctags](https://github.com/universal-ctags/ctags). This is helpful if you plan to use aider and GPT-4 with repositories that have more than a handful of files.  This allows aider to build a [map of your entire git repo](https://aider.chat/docs/ctags.html) and share it with GPT to help it better understand and modify large codebases.
+  * The `ctags` command needs to be on your shell path so that it will run by default when aider invokes `ctags ...`.
+  * You need a build which includes the json feature. You can check by running `ctags --version` and looking for `+json` in the `Optional compiled features` list.
 
 ## Usage
 
@@ -109,7 +96,8 @@ Run the `aider` tool by executing the following command:
 aider <file1> <file2> ...
 ```
 
-Replace `<file1>`, `<file2>`, etc., with the paths to the source code files you want to work on. These files will be added to the chat session.
+Replace `<file1>`, `<file2>`, etc., with the paths to the source code files you want to work on.
+These files will be "added to the chat session", so that GPT can see their contents and edit them according to your instructions.
 
 You can also just launch `aider` anywhere in a git repo without naming
 files on the command line.  It will discover all the files in the
@@ -118,7 +106,11 @@ session with the `/add` and `/drop` chat commands described below.
 If you or GPT mention one of the repo's filenames in the conversation,
 aider will ask if you'd like to add it to the chat.
 
-You can also use additional command-line options, environment variables or configuration file
+Aider will work best if you think about which files need to be edited to make your change and add them to the chat.
+Aider has some ability to help GPT figure out which files to edit all by itself, but the most effective approach is to explicitly add the needed files to the chat yourself.
+
+Aider also has many
+additional command-line options, environment variables or configuration file
 to set many options. See `aider --help` for details.
 
 ## In-chat commands
@@ -132,8 +124,11 @@ Aider supports commands from within the chat, which all start with `/`. Here are
 * `/run <command>`: Run a shell command and optionally add the output to the chat.
 * `/help`: Show help about all commands.
 
+
 ## Tips
 
+* Think about which files need to be edited to make your change and add them to the chat.
+Aider has some ability to help GPT figure out which files to edit all by itself, but the most effective approach is to explicitly add the needed files to the chat yourself. 
 * Large changes are best performed as a sequence of thoughtful bite sized steps, where you plan out the approach and overall design. Walk GPT through changes like you might with a junior dev. Ask for a refactor to prepare, then ask for the actual change. Spend the time to ask for code quality/structure improvements.
 * Use Control-C to safely interrupt GPT if it isn't providing a useful response. The partial response remains in the conversation, so you can refer to it when you reply to GPT with more information or direction.
 * Use the `/run` command to run tests, linters, etc and show the output to GPT so it can fix any issues.
@@ -144,19 +139,51 @@ Aider supports commands from within the chat, which all start with `/`. Here are
 * GPT can only see the content of the files you specifically "add to the chat". Aider also sends GPT-4 a [map of your entire git repo](https://aider.chat/docs/ctags.html). So GPT may ask to see additional files if it feels that's needed for your requests.
 * I also shared some general [GPT coding tips on Hacker News](https://news.ycombinator.com/item?id=36211879).
 
+## GPT-4 vs GPT-3.5
+
+Aider supports all of OpenAI's chat models, including
+the the brand new `gpt-3.5-turbo-16k` model. 
+
+You will probably get the best results with one of the GPT-4 models,
+because of their large context windows,
+adherance to system prompt instructions and
+greater competance at coding tasks.
+The GPT-4 models are able to structure code edits as simple "diffs"
+and use a
+[repository map](https://aider.chat/docs/ctags.html)
+to improve their ability to make changes in larger codebases.
+
+The GPT-3.5 models are supported more experimentally
+and are limited to editing somewhat smaller codebases.
+They are less able to follow instructions and
+aren't able to return code edits in a compact "diff" format.
+So aider has
+to ask GPT-3.5 to return a new copy of the "whole file" with edits included.
+This rapidly uses up tokens and can hit the limits of the context window.
+
+Aider disables the
+[repository map feature](https://aider.chat/docs/ctags.html)
+when used with GPT-3.5 models.
+The `gpt-3.5-turbo` context window is too small to include a repo map.
+Evaluation is still needed to determine if `gpt-3.5-turbo-16k` can make use of a repo map.
+
+In practice, this means you can use aider to edit a set of source files
+that total up to the sizes below.
+You can (and should) add just the specific set of files to the chat
+that are relevant to the change you are requesting.
+This minimizes your use of the context window, as well as costs.
+
+| Model             | Context<br>Size | Edit<br>Format | Max<br>File Size | Max<br>File Size | Repo<br>Map? |
+| ----------------- | -- | --     | -----| -- | -- |
+| gpt-3.5-turbo     |  4k tokens | whole file | 2k tokens | ~8k bytes | no |
+| gpt-3.5-turbo-16k | 16k tokens | whole file | 8k tokens | ~32k bytes | no |
+| gpt-4             |  8k tokens | diffs | 8k tokens | ~32k bytes | yes | 
+| gpt-4-32k         | 32k tokens | diffs | 32k tokens  | ~128k bytes | yes |
+
 ## Kind words from users
 
+* The best AI coding assistant so far." -- [Matthew Berman](https://www.youtube.com/watch?v=df8afeb1FY8)
 * "Aider ... has easily quadrupled my coding productivity." -- [SOLAR_FIELDS](https://news.ycombinator.com/item?id=36212100)
 * "What an amazing tool. It's incredible." -- [valyagolev](https://github.com/paul-gauthier/aider/issues/6#issue-1722897858)
 * "It was WAY faster than I would be getting off the ground and making the first few working versions." -- [Daniel Feldman](https://twitter.com/d_feldman/status/1662295077387923456)
 
-## Limitations
-
-You can only use aider to edit code that fits in the GPT context window.
-For GPT-4 that is 8k tokens, and for GPT-3.5 that is 4k tokens.
-Aider lets you manage the context window by
-being selective about how many source files you discuss with aider at one time.
-You might consider refactoring your code into more, smaller files (which is usually a good idea anyway).
-You can use aider to help perform such refactorings, if you start before the files get too large.
-
-If you have access to gpt-4-32k, I would be curious to hear how it works with aider.

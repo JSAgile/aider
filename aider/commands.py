@@ -79,9 +79,8 @@ class Commands:
         self.coder.commit(message=commit_message, which="repo_files")
 
     def cmd_clear(self, args):
-        "Clear the chat history and drop all files from the chat context"
+        "Clear the chat history"
 
-        self.coder.abs_fnames = set()
         self.coder.done_messages = []
         self.coder.cur_messages = []
 
@@ -96,7 +95,7 @@ class Commands:
             dict(role="system", content=self.coder.gpt_prompts.system_reminder),
         ]
         tokens = len(self.tokenizer.encode(json.dumps(msgs)))
-        res.append((tokens, "system messages"))
+        res.append((tokens, "system messages", ""))
 
         # chat history
         msgs = self.coder.done_messages + self.coder.cur_messages
@@ -104,7 +103,7 @@ class Commands:
             msgs = [dict(role="dummy", content=msg) for msg in msgs]
             msgs = json.dumps(msgs)
             tokens = len(self.tokenizer.encode(msgs))
-            res.append((tokens, "chat history"))
+            res.append((tokens, "chat history", "use /clear to clear"))
 
         # repo map
         other_files = set(self.coder.get_all_abs_files()) - set(self.coder.abs_fnames)
@@ -112,33 +111,41 @@ class Commands:
             repo_content = self.coder.repo_map.get_repo_map(self.coder.abs_fnames, other_files)
             if repo_content:
                 tokens = len(self.tokenizer.encode(repo_content))
-                res.append((tokens, "repository map"))
+                res.append((tokens, "repository map", "use --map-tokens to resize"))
 
         # files
         for fname in self.coder.abs_fnames:
             relative_fname = self.coder.get_rel_fname(fname)
             quoted = utils.quoted_file(fname, relative_fname)
             tokens = len(self.tokenizer.encode(quoted))
-            res.append((tokens, relative_fname))
+            res.append((tokens, f"{relative_fname}", "use /drop to drop from chat"))
 
-        print("Context window usage, in tokens:")
-        print()
+        self.io.tool_output("Approximate context window usage, in tokens:")
+        self.io.tool_output()
+
+        width = 8
 
         def fmt(v):
-            return format(int(v), ",").rjust(6)
+            return format(int(v), ",").rjust(width)
+
+        col_width = max(len(row[1]) for row in res)
 
         total = 0
-        for tk, msg in res:
+        for tk, msg, tip in res:
             total += tk
-            print(f"{fmt(tk)} {msg}")
+            msg = msg.ljust(col_width)
+            self.io.tool_output(f"{fmt(tk)} {msg} {tip}")
 
-        print()
-        print(f"{fmt(total)} total")
+        self.io.tool_output("=" * width)
+        self.io.tool_output(f"{fmt(total)} tokens total")
 
         limit = self.coder.main_model.max_context_tokens
         remaining = limit - total
-        print(f"{fmt(remaining)} remaining")
-        print(f"{fmt(limit)} max context window")
+        if remaining > 0:
+            self.io.tool_output(f"{fmt(remaining)} tokens remaining in context window")
+        else:
+            self.io.tool_error(f"{fmt(remaining)} tokens remaining, window exhausted!")
+        self.io.tool_output(f"{fmt(limit)} tokens max context window size")
 
     def cmd_undo(self, args):
         "Undo the last git commit if it was done by aider"
@@ -183,7 +190,7 @@ class Commands:
             "was reset and removed from git.\n"
         )
 
-        if self.coder.main_model.is_gpt4():
+        if self.coder.main_model.send_undo_reply:
             return prompts.undo_command_reply
 
     def cmd_diff(self, args):
@@ -270,6 +277,10 @@ class Commands:
     def cmd_drop(self, args):
         "Remove matching files from the chat session"
 
+        if not args.strip():
+            self.io.tool_output("Dropping all files from the chat session.")
+            self.coder.abs_fnames = set()
+
         for word in args.split():
             matched_files = [
                 file
@@ -295,7 +306,7 @@ class Commands:
         except Exception as e:
             self.io.tool_error(f"Error running command: {e}")
 
-        print(combined_output)
+        self.io.tool_output(combined_output)
 
         if self.io.confirm_ask("Add the output to the chat?", default="y"):
             for line in combined_output.splitlines():
